@@ -18,12 +18,22 @@ package io.netty.channel.uring;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.socket.DatagramPacket;
 import io.netty.channel.unix.Buffer;
+import io.netty.util.internal.CleanableDirectBuffer;
 
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 
 final class MsgHdrMemory {
     private static final byte[] EMPTY_SOCKADDR_STORAGE = new byte[Native.SIZEOF_SOCKADDR_STORAGE];
+    // It is not possible to have a zero length buffer in sendFd,
+    // so we use a 1 byte buffer here.
+    private static final int GLOBAL_IOV_LEN = 1;
+    private static final ByteBuffer GLOBAL_IOV_BASE =  Buffer.allocateDirectWithNativeOrder(GLOBAL_IOV_LEN);
+    private static final long GLOBAL_IOV_BASE_ADDRESS = Buffer.memoryAddress(GLOBAL_IOV_BASE);
+    private final CleanableDirectBuffer msgHdrMemoryCleanable;
+    private final CleanableDirectBuffer socketAddrMemoryCleanable;
+    private final CleanableDirectBuffer iovMemoryCleanable;
+    private final CleanableDirectBuffer cmsgDataMemoryCleanable;
     private final ByteBuffer msgHdrMemory;
     private final ByteBuffer socketAddrMemory;
     private final ByteBuffer iovMemory;
@@ -35,15 +45,44 @@ final class MsgHdrMemory {
 
     MsgHdrMemory(short idx) {
         this.idx = idx;
-        msgHdrMemory = Buffer.allocateDirectWithNativeOrder(Native.SIZEOF_MSGHDR);
+        msgHdrMemoryCleanable = Buffer.allocateDirectBufferWithNativeOrder(Native.SIZEOF_MSGHDR);
+        socketAddrMemoryCleanable = Buffer.allocateDirectBufferWithNativeOrder(Native.SIZEOF_SOCKADDR_STORAGE);
+        iovMemoryCleanable = Buffer.allocateDirectBufferWithNativeOrder(Native.SIZEOF_IOVEC);
+        cmsgDataMemoryCleanable = Buffer.allocateDirectBufferWithNativeOrder(Native.CMSG_SPACE);
+
+        msgHdrMemory = msgHdrMemoryCleanable.buffer();
+        socketAddrMemory = socketAddrMemoryCleanable.buffer();
+        iovMemory = iovMemoryCleanable.buffer();
+        cmsgDataMemory = cmsgDataMemoryCleanable.buffer();
+
         msgHdrMemoryAddress = Buffer.memoryAddress(msgHdrMemory);
-        socketAddrMemory = Buffer.allocateDirectWithNativeOrder(Native.SIZEOF_SOCKADDR_STORAGE);
-        iovMemory = Buffer.allocateDirectWithNativeOrder(Native.SIZEOF_IOVEC);
-        cmsgDataMemory = Buffer.allocateDirectWithNativeOrder(Native.CMSG_SPACE);
 
         long cmsgDataMemoryAddr = Buffer.memoryAddress(cmsgDataMemory);
         long cmsgDataAddr = Native.cmsghdrData(cmsgDataMemoryAddr);
-        cmsgDataOffset = (int) (cmsgDataAddr + cmsgDataMemoryAddr);
+        cmsgDataOffset = (int) (cmsgDataAddr - cmsgDataMemoryAddr);
+    }
+
+    MsgHdrMemory() {
+        this.idx = 0;
+        // jdk will memset the memory to 0, so we don't need to do it here.
+        msgHdrMemoryCleanable = Buffer.allocateDirectBufferWithNativeOrder(Native.SIZEOF_MSGHDR);
+        socketAddrMemoryCleanable = null;
+        iovMemoryCleanable = Buffer.allocateDirectBufferWithNativeOrder(Native.SIZEOF_IOVEC);
+        cmsgDataMemoryCleanable = Buffer.allocateDirectBufferWithNativeOrder(Native.CMSG_SPACE_FOR_FD);
+
+        msgHdrMemory = msgHdrMemoryCleanable.buffer();
+        socketAddrMemory = null;
+        iovMemory = iovMemoryCleanable.buffer();
+        cmsgDataMemory = cmsgDataMemoryCleanable.buffer();
+
+        msgHdrMemoryAddress = Buffer.memoryAddress(msgHdrMemory);
+        // These two parameters must be set to valid values and cannot be 0,
+        // otherwise the fd we get in io_uring_recvmsg is 0
+        Iov.set(iovMemory, GLOBAL_IOV_BASE_ADDRESS, GLOBAL_IOV_LEN);
+
+        long cmsgDataMemoryAddr = Buffer.memoryAddress(cmsgDataMemory);
+        long cmsgDataAddr = Native.cmsghdrData(cmsgDataMemoryAddr);
+        cmsgDataOffset = (int) (cmsgDataAddr - cmsgDataMemoryAddr);
     }
 
     void set(LinuxSocket socket, InetSocketAddress address, long bufferAddress , int length, short segmentSize) {
@@ -62,6 +101,18 @@ final class MsgHdrMemory {
         Iov.set(iovMemory, bufferAddress, length);
         MsgHdr.set(msgHdrMemory, socketAddrMemory, addressLength, iovMemory, 1, cmsgDataMemory,
                 cmsgDataOffset, segmentSize);
+    }
+
+    void setScmRightsFd(int fd) {
+        MsgHdr.prepSendFd(msgHdrMemory, fd, cmsgDataMemory, cmsgDataOffset, iovMemory, 1);
+    }
+
+    int getScmRightsFd() {
+        return MsgHdr.getCmsgData(msgHdrMemory, cmsgDataMemory, cmsgDataOffset);
+    }
+
+    void prepRecvReadFd() {
+        MsgHdr.prepReadFd(msgHdrMemory, cmsgDataMemory, cmsgDataOffset, iovMemory, 1);
     }
 
     boolean hasPort(IoUringDatagramChannel channel) {
@@ -103,9 +154,11 @@ final class MsgHdrMemory {
     }
 
     void release() {
-        Buffer.free(msgHdrMemory);
-        Buffer.free(socketAddrMemory);
-        Buffer.free(iovMemory);
-        Buffer.free(cmsgDataMemory);
+        msgHdrMemoryCleanable.clean();
+        if (socketAddrMemoryCleanable != null) {
+            socketAddrMemoryCleanable.clean();
+        }
+        iovMemoryCleanable.clean();
+        cmsgDataMemoryCleanable.clean();
     }
 }

@@ -15,7 +15,6 @@
  */
 package io.netty.channel.uring;
 
-import io.netty.buffer.Unpooled;
 import io.netty.channel.IoHandlerContext;
 import io.netty.channel.IoHandle;
 import io.netty.channel.IoHandler;
@@ -29,6 +28,7 @@ import io.netty.channel.unix.IovArray;
 import io.netty.util.collection.IntObjectHashMap;
 import io.netty.util.collection.IntObjectMap;
 import io.netty.util.concurrent.ThreadAwareExecutor;
+import io.netty.util.internal.CleanableDirectBuffer;
 import io.netty.util.internal.ObjectUtil;
 import io.netty.util.internal.StringUtil;
 import io.netty.util.internal.logging.InternalLogger;
@@ -62,8 +62,10 @@ public final class IoUringIoHandler implements IoHandler {
 
     private final AtomicBoolean eventfdAsyncNotify = new AtomicBoolean();
     private final FileDescriptor eventfd;
+    private final CleanableDirectBuffer eventfdReadBufCleanable;
     private final ByteBuffer eventfdReadBuf;
     private final long eventfdReadBufAddress;
+    private final CleanableDirectBuffer timeoutMemoryCleanable;
     private final ByteBuffer timeoutMemory;
     private final long timeoutMemoryAddress;
     private final IovArray iovArray;
@@ -140,17 +142,17 @@ public final class IoUringIoHandler implements IoHandler {
 
         registrations = new IntObjectHashMap<>();
         eventfd = Native.newBlockingEventFd();
-        eventfdReadBuf = Buffer.allocateDirectWithNativeOrder(Long.BYTES);
+        eventfdReadBufCleanable = Buffer.allocateDirectBufferWithNativeOrder(Long.BYTES);
+        eventfdReadBuf = eventfdReadBufCleanable.buffer();
         eventfdReadBufAddress = Buffer.memoryAddress(eventfdReadBuf);
-        this.timeoutMemory = Buffer.allocateDirectWithNativeOrder(KERNEL_TIMESPEC_SIZE);
-        this.timeoutMemoryAddress = Buffer.memoryAddress(timeoutMemory);
+        timeoutMemoryCleanable = Buffer.allocateDirectBufferWithNativeOrder(KERNEL_TIMESPEC_SIZE);
+        timeoutMemory = timeoutMemoryCleanable.buffer();
+        timeoutMemoryAddress = Buffer.memoryAddress(timeoutMemory);
         // We buffer a maximum of 2 * CompletionQueue.ringCapacity completions before we drain them in batches.
         // Also as we never submit an udata which is 0L we use this as the tombstone marker.
         completionBuffer = new CompletionBuffer(ringBuffer.ioUringCompletionQueue().ringCapacity * 2, 0);
 
-        iovArray = new IovArray(Unpooled.wrappedBuffer(
-                Buffer.allocateDirectWithNativeOrder(IoUring.NUM_ELEMENTS_IOVEC * IovArray.IOV_SIZE))
-                .setIndex(0, 0));
+        iovArray = new IovArray(IoUring.NUM_ELEMENTS_IOVEC);
     }
 
     @Override
@@ -167,7 +169,6 @@ public final class IoUringIoHandler implements IoHandler {
         if (closeCompleted) {
             return 0;
         }
-        int processedPerRun = 0;
         SubmissionQueue submissionQueue = ringBuffer.ioUringSubmissionQueue();
         CompletionQueue completionQueue = ringBuffer.ioUringCompletionQueue();
         if (!completionQueue.hasCompletions() && context.canBlock()) {
@@ -177,23 +178,10 @@ public final class IoUringIoHandler implements IoHandler {
             long timeoutNanos = context.deadlineNanos() == -1 ? -1 : context.delayNanos(System.nanoTime());
             submitAndWaitWithTimeout(submissionQueue, false, timeoutNanos);
         } else {
-            submitAndClear(submissionQueue);
+            // Even if we have some completions already pending we can still try to even fetch more.
+            submitAndClearNow(submissionQueue);
         }
-        for (;;) {
-            // we might call submitAndRunNow() while processing stuff in the completionArray we need to
-            // add the processed completions to processedPerRun.
-            int processed = drainAndProcessAll(completionQueue, this::handle);
-            processedPerRun += processed;
-
-            // Let's submit again.
-            // If we were not able to submit anything and there was nothing left in the completionBuffer we will
-            // break out of the loop and return to the caller.
-            if (submitAndClear(submissionQueue) == 0 && processed == 0) {
-                break;
-            }
-        }
-
-        return processedPerRun;
+        return drainAndProcessAll(completionQueue, this::handle);
     }
 
     void submitAndRunNow(long udata) {
@@ -202,14 +190,14 @@ public final class IoUringIoHandler implements IoHandler {
         }
         SubmissionQueue submissionQueue = ringBuffer.ioUringSubmissionQueue();
         CompletionQueue completionQueue = ringBuffer.ioUringCompletionQueue();
-        if (submitAndClear(submissionQueue) > 0) {
+        if (submitAndClearNow(submissionQueue) > 0) {
             completionBuffer.drain(completionQueue);
             completionBuffer.processOneNow(this::handle, udata);
         }
     }
 
-    private int submitAndClear(SubmissionQueue submissionQueue) {
-        int submitted = submissionQueue.submit();
+    private int submitAndClearNow(SubmissionQueue submissionQueue) {
+        int submitted = submissionQueue.submitAndGetNow();
 
         // Clear the iovArray as we can re-use it now as things are considered stable after submission:
         // See https://man7.org/linux/man-pages/man3/io_uring_prep_sendmsg.3.html
@@ -228,8 +216,9 @@ public final class IoUringIoHandler implements IoHandler {
         }
         return new IoUringBufferRing(ringFd,
                 Buffer.wrapMemoryAddressWithNativeOrder(ioUringBufRingAddr, Native.ioUringBufRingSize(bufferRingSize)),
-                bufferRingSize, bufferRingConfig.batchSize(), bufferRingConfig.maxUnreleasedBuffers(),
-                bufferGroupId, bufferRingConfig.isIncremental(), bufferRingConfig.allocator()
+                bufferRingSize, bufferRingConfig.batchSize(),
+                bufferGroupId, bufferRingConfig.isIncremental(), bufferRingConfig.allocator(),
+                bufferRingConfig.isBatchAllocation()
         );
     }
 
@@ -341,7 +330,7 @@ public final class IoUringIoHandler implements IoHandler {
                 submissionQueue.addTimeout(timeoutMemoryAddress, udata);
             }
         }
-        int submitted = submissionQueue.submitAndWait();
+        int submitted = submissionQueue.submitAndGet();
         // Clear the iovArray as we can re-use it now as things are considered stable after submission:
         // See https://man7.org/linux/man-pages/man3/io_uring_prep_sendmsg.3.html
         iovArray.clear();
@@ -368,12 +357,12 @@ public final class IoUringIoHandler implements IoHandler {
         submissionQueue.addNop((byte) Native.IOSQE_IO_DRAIN, udata);
 
         // Submit everything and wait until we could drain i.
-        submissionQueue.submitAndWait();
+        submissionQueue.submitAndGet();
         while (completionQueue.hasCompletions()) {
             completionQueue.process(this::handle);
 
             if (submissionQueue.count() > 0) {
-                submissionQueue.submit();
+                submissionQueue.submitAndGetNow();
             }
         }
     }
@@ -438,7 +427,7 @@ public final class IoUringIoHandler implements IoHandler {
             drainAndProcessAll(completionQueue, handler);
             completionQueue.process(handler);
             while (!handler.eventFdDrained) {
-                submissionQueue.submitAndWait();
+                submissionQueue.submitAndGet();
                 drainAndProcessAll(completionQueue, handler);
             }
         }
@@ -465,8 +454,8 @@ public final class IoUringIoHandler implements IoHandler {
         } catch (IOException e) {
             logger.warn("Failed to close eventfd", e);
         }
-        Buffer.free(eventfdReadBuf);
-        Buffer.free(timeoutMemory);
+        eventfdReadBufCleanable.clean();
+        timeoutMemoryCleanable.clean();
         iovArray.release();
     }
 
@@ -635,7 +624,7 @@ public final class IoUringIoHandler implements IoHandler {
     IovArray iovArray() {
         if (iovArray.isFull()) {
             // Submit so we can reuse the iovArray.
-            submitAndClear(ringBuffer.ioUringSubmissionQueue());
+            submitAndClearNow(ringBuffer.ioUringSubmissionQueue());
         }
         assert iovArray.count() == 0;
         return iovArray;

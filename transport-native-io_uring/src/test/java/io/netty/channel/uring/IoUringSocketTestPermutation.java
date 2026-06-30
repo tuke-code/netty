@@ -26,6 +26,8 @@ import io.netty.channel.socket.SocketProtocolFamily;
 import io.netty.channel.socket.nio.NioDatagramChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
+import io.netty.channel.unix.DomainSocketAddress;
+import io.netty.channel.unix.tests.UnixTestUtils;
 import io.netty.testsuite.transport.TestsuitePermutation;
 import io.netty.testsuite.transport.TestsuitePermutation.BootstrapComboFactory;
 import io.netty.testsuite.transport.TestsuitePermutation.BootstrapFactory;
@@ -34,34 +36,42 @@ import io.netty.util.concurrent.DefaultThreadFactory;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.ThreadLocalRandom;
 
 public class IoUringSocketTestPermutation extends SocketTestPermutation {
 
     static final IoUringSocketTestPermutation INSTANCE = new IoUringSocketTestPermutation();
     static final short BGID = 0;
-    static final EventLoopGroup IO_URING_BOSS_GROUP = new MultiThreadIoEventLoopGroup(
-            BOSSES, new DefaultThreadFactory("testsuite-io_uring-boss", true), IoUringIoHandler.newFactory());
-    static final EventLoopGroup IO_URING_WORKER_GROUP = newWorkerGroup(false);
-    static final EventLoopGroup IO_URING_INCREMENTAL_WORKER_GROUP = newWorkerGroup(true);
+    static final EventLoopGroup IO_URING_GROUP = newGroup(false);
+    static final EventLoopGroup IO_URING_INCREMENTAL_GROUP = newGroup(true);
 
     static IoUringIoHandlerConfig buildConfig(boolean incremental) {
         IoUringIoHandlerConfig config = new IoUringIoHandlerConfig();
         if (IoUring.isRegisterBufferRingSupported()) {
             config.setBufferRingConfig(
-                    new IoUringBufferRingConfig(BGID, (short) 16, 8, 16 * 16,
-                            incremental, new IoUringFixedBufferRingAllocator(1024)));
+                    IoUringBufferRingConfig.builder()
+                            .bufferGroupId(BGID)
+                            .bufferRingSize((short) 16)
+                            .batchSize(8)
+                            .incremental(incremental)
+                            .allocator(new IoUringFixedBufferRingAllocator(1024),
+                                    // Ensure we test both variants
+                                    ThreadLocalRandom.current().nextBoolean())
+                            .build()
+            );
         }
         return config;
     }
 
-    private static EventLoopGroup newWorkerGroup(boolean incremental) {
+    private static EventLoopGroup newGroup(boolean incremental) {
         if (!IoUring.isRegisterBufferRingIncSupported() && incremental) {
             return null;
         }
         return new MultiThreadIoEventLoopGroup(
-                WORKERS, new DefaultThreadFactory(incremental ?
-                "testsuite-io_uring-worker-buffer-ring-incremental" : "testsuite-io_uring-worker", true),
+                NUM_THREADS, new DefaultThreadFactory(incremental ?
+                "testsuite-io_uring-group-buffer-ring-incremental" : "testsuite-io_uring-group", true),
                 IoUringIoHandler.newFactory(buildConfig(incremental)));
     }
 
@@ -82,15 +92,15 @@ public class IoUringSocketTestPermutation extends SocketTestPermutation {
         toReturn.add(new BootstrapFactory<ServerBootstrap>() {
             @Override
             public ServerBootstrap newInstance() {
-                return new ServerBootstrap().group(IO_URING_BOSS_GROUP, IO_URING_WORKER_GROUP)
+                return new ServerBootstrap().group(IO_URING_GROUP)
                                             .channel(IoUringServerSocketChannel.class);
             }
         });
-        if (IO_URING_INCREMENTAL_WORKER_GROUP != null) {
+        if (IO_URING_INCREMENTAL_GROUP != null) {
             toReturn.add(new BootstrapFactory<ServerBootstrap>() {
                 @Override
                 public ServerBootstrap newInstance() {
-                    return new ServerBootstrap().group(IO_URING_BOSS_GROUP, IO_URING_INCREMENTAL_WORKER_GROUP)
+                    return new ServerBootstrap().group(IO_URING_INCREMENTAL_GROUP)
                             .channel(IoUringServerSocketChannel.class);
                 }
             });
@@ -99,19 +109,17 @@ public class IoUringSocketTestPermutation extends SocketTestPermutation {
             toReturn.add(new BootstrapFactory<ServerBootstrap>() {
                 @Override
                 public ServerBootstrap newInstance() {
-                    ServerBootstrap serverBootstrap = new ServerBootstrap().group(IO_URING_BOSS_GROUP,
-                                                                                  IO_URING_WORKER_GROUP)
+                    ServerBootstrap serverBootstrap = new ServerBootstrap().group(IO_URING_GROUP)
                                                                            .channel(IoUringServerSocketChannel.class);
                     serverBootstrap.option(ChannelOption.TCP_FASTOPEN, 5);
                     return serverBootstrap;
                 }
             });
-            if (IO_URING_INCREMENTAL_WORKER_GROUP != null) {
+            if (IO_URING_INCREMENTAL_GROUP != null) {
                 toReturn.add(new BootstrapFactory<ServerBootstrap>() {
                     @Override
                     public ServerBootstrap newInstance() {
-                        ServerBootstrap serverBootstrap = new ServerBootstrap().group(IO_URING_BOSS_GROUP,
-                                        IO_URING_INCREMENTAL_WORKER_GROUP)
+                        ServerBootstrap serverBootstrap = new ServerBootstrap().group(IO_URING_INCREMENTAL_GROUP)
                                 .channel(IoUringServerSocketChannel.class);
                         serverBootstrap.option(ChannelOption.TCP_FASTOPEN, 5);
                         return serverBootstrap;
@@ -122,7 +130,7 @@ public class IoUringSocketTestPermutation extends SocketTestPermutation {
         toReturn.add(new BootstrapFactory<ServerBootstrap>() {
             @Override
             public ServerBootstrap newInstance() {
-                return new ServerBootstrap().group(nioBossGroup, nioWorkerGroup)
+                return new ServerBootstrap().group(NIO_GROUP)
                                             .channel(NioServerSocketChannel.class);
             }
         });
@@ -137,15 +145,15 @@ public class IoUringSocketTestPermutation extends SocketTestPermutation {
                 new BootstrapFactory<Bootstrap>() {
                     @Override
                     public Bootstrap newInstance() {
-                        return new Bootstrap().group(IO_URING_WORKER_GROUP).channel(IoUringSocketChannel.class);
+                        return new Bootstrap().group(IO_URING_GROUP).channel(IoUringSocketChannel.class);
                     }
                 });
-        if (IO_URING_INCREMENTAL_WORKER_GROUP != null) {
+        if (IO_URING_INCREMENTAL_GROUP != null) {
             toReturn.add(
                     new BootstrapFactory<Bootstrap>() {
                         @Override
                         public Bootstrap newInstance() {
-                            return new Bootstrap().group(IO_URING_INCREMENTAL_WORKER_GROUP)
+                            return new Bootstrap().group(IO_URING_INCREMENTAL_GROUP)
                                     .channel(IoUringSocketChannel.class);
                         }
                     });
@@ -154,7 +162,7 @@ public class IoUringSocketTestPermutation extends SocketTestPermutation {
                 new BootstrapFactory<Bootstrap>() {
                     @Override
                     public Bootstrap newInstance() {
-                        return new Bootstrap().group(nioWorkerGroup).channel(NioSocketChannel.class);
+                        return new Bootstrap().group(NIO_GROUP).channel(NioSocketChannel.class);
                     }
                 }
         );
@@ -170,15 +178,15 @@ public class IoUringSocketTestPermutation extends SocketTestPermutation {
             factories.add(insertIndex, new BootstrapFactory<Bootstrap>() {
                 @Override
                 public Bootstrap newInstance() {
-                    return new Bootstrap().group(IO_URING_WORKER_GROUP).channel(IoUringSocketChannel.class)
+                    return new Bootstrap().group(IO_URING_GROUP).channel(IoUringSocketChannel.class)
                             .option(ChannelOption.TCP_FASTOPEN_CONNECT, true);
                 }
             });
-            if (IO_URING_INCREMENTAL_WORKER_GROUP != null) {
+            if (IO_URING_INCREMENTAL_GROUP != null) {
                 factories.add(insertIndex + 1, new BootstrapFactory<Bootstrap>() {
                     @Override
                     public Bootstrap newInstance() {
-                        return new Bootstrap().group(IO_URING_INCREMENTAL_WORKER_GROUP)
+                        return new Bootstrap().group(IO_URING_INCREMENTAL_GROUP)
                                 .channel(IoUringSocketChannel.class)
                                 .option(ChannelOption.TCP_FASTOPEN_CONNECT, true);
                     }
@@ -189,6 +197,10 @@ public class IoUringSocketTestPermutation extends SocketTestPermutation {
         return factories;
     }
 
+    public List<TestsuitePermutation.BootstrapComboFactory<ServerBootstrap, Bootstrap>> domainSocket() {
+        return combo(serverDomainSocket(), clientDomainSocket());
+    }
+
     @Override
     public List<TestsuitePermutation.BootstrapComboFactory<Bootstrap, Bootstrap>> datagram(
             final SocketProtocolFamily family) {
@@ -197,7 +209,7 @@ public class IoUringSocketTestPermutation extends SocketTestPermutation {
                 new BootstrapFactory<Bootstrap>() {
                     @Override
                     public Bootstrap newInstance() {
-                        return new Bootstrap().group(IO_URING_WORKER_GROUP)
+                        return new Bootstrap().group(IO_URING_GROUP)
                                 .channelFactory(new ChannelFactory<Channel>() {
                             @Override
                             public Channel newChannel() {
@@ -214,7 +226,7 @@ public class IoUringSocketTestPermutation extends SocketTestPermutation {
                 new BootstrapFactory<Bootstrap>() {
                     @Override
                     public Bootstrap newInstance() {
-                        return new Bootstrap().group(nioWorkerGroup).channelFactory(new ChannelFactory<Channel>() {
+                        return new Bootstrap().group(NIO_GROUP).channelFactory(new ChannelFactory<Channel>() {
                             @Override
                             public Channel newChannel() {
                                 return new NioDatagramChannel(family);
@@ -231,4 +243,33 @@ public class IoUringSocketTestPermutation extends SocketTestPermutation {
 
         return combo(bfs, bfs);
     }
+
+    public List<BootstrapFactory<ServerBootstrap>> serverDomainSocket() {
+        return Collections.<BootstrapFactory<ServerBootstrap>>singletonList(
+                new BootstrapFactory<ServerBootstrap>() {
+                    @Override
+                    public ServerBootstrap newInstance() {
+                        return new ServerBootstrap().group(IO_URING_GROUP)
+                                .channel(IoUringServerDomainSocketChannel.class);
+                    }
+                }
+        );
+    }
+
+    public List<BootstrapFactory<Bootstrap>> clientDomainSocket() {
+        return Collections.<BootstrapFactory<Bootstrap>>singletonList(
+                new BootstrapFactory<Bootstrap>() {
+                    @Override
+                    public Bootstrap newInstance() {
+                        return new Bootstrap().group(IO_URING_GROUP)
+                                .channel(IoUringDomainSocketChannel.class);
+                    }
+                }
+        );
+    }
+
+    public static DomainSocketAddress newDomainSocketAddress() {
+        return UnixTestUtils.newDomainSocketAddress();
+    }
+
 }

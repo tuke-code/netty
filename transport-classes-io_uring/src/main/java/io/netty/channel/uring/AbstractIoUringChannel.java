@@ -39,12 +39,14 @@ import io.netty.channel.socket.ChannelInputShutdownEvent;
 import io.netty.channel.socket.ChannelInputShutdownReadComplete;
 import io.netty.channel.socket.SocketChannelConfig;
 import io.netty.channel.unix.Buffer;
+import io.netty.channel.unix.DomainSocketAddress;
 import io.netty.channel.unix.Errors;
 import io.netty.channel.unix.FileDescriptor;
 import io.netty.channel.unix.UnixChannel;
 import io.netty.channel.unix.UnixChannelUtil;
 import io.netty.util.ReferenceCountUtil;
 import io.netty.util.concurrent.PromiseNotifier;
+import io.netty.util.internal.CleanableDirectBuffer;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 
@@ -120,6 +122,7 @@ abstract class AbstractIoUringChannel extends AbstractChannel implements UnixCha
     private ChannelPromise connectPromise;
     private ScheduledFuture<?> connectTimeoutFuture;
     private SocketAddress requestedRemoteAddress;
+    private CleanableDirectBuffer cleanable;
     private ByteBuffer remoteAddressMemory;
     private MsgHdrMemoryArray msgHdrMemoryArray;
 
@@ -232,6 +235,10 @@ abstract class AbstractIoUringChannel extends AbstractChannel implements UnixCha
         return newDirectBuffer(buf, buf);
     }
 
+    protected boolean allowMultiShotPollIn() {
+        return IoUring.isPollAddMultishotEnabled();
+    }
+
     protected final ByteBuf newDirectBuffer(Object holder, ByteBuf buf) {
         final int readableBytes = buf.readableBytes();
         if (readableBytes == 0) {
@@ -283,7 +290,8 @@ abstract class AbstractIoUringChannel extends AbstractChannel implements UnixCha
 
     private void freeRemoteAddressMemory() {
         if (remoteAddressMemory != null) {
-            Buffer.free(remoteAddressMemory);
+            cleanable.clean();
+            cleanable = null;
             remoteAddressMemory = null;
         }
     }
@@ -428,7 +436,7 @@ abstract class AbstractIoUringChannel extends AbstractChannel implements UnixCha
         remote = socket.remoteAddress();
     }
 
-    abstract class AbstractUringUnsafe extends AbstractUnsafe implements IoUringIoHandle {
+    protected abstract class AbstractUringUnsafe extends AbstractUnsafe implements IoUringIoHandle {
         private IoUringRecvByteAllocatorHandle allocHandle;
         private boolean closed;
         private boolean freed;
@@ -730,7 +738,7 @@ abstract class AbstractIoUringChannel extends AbstractChannel implements UnixCha
             if (!isActive() || shouldBreakIoUringInReady(config())) {
                 return;
             }
-            pollInId = schedulePollAdd(POLL_IN_SCHEDULED, Native.POLLIN, IoUring.isPollAddMultishotEnabled());
+            pollInId = schedulePollAdd(POLL_IN_SCHEDULED, Native.POLLIN, allowMultiShotPollIn());
         }
 
         private void readComplete(byte op, int res, int flags, short data) {
@@ -1092,36 +1100,43 @@ abstract class AbstractIoUringChannel extends AbstractChannel implements UnixCha
                     socket.bind(localAddress);
                 }
 
-                InetSocketAddress inetSocketAddress = (InetSocketAddress) remoteAddress;
-
-                ByteBuf initialData = null;
-                if (IoUring.isTcpFastOpenClientSideAvailable() &&
+                if (remoteAddress instanceof InetSocketAddress) {
+                    InetSocketAddress inetSocketAddress = (InetSocketAddress) remoteAddress;
+                    ByteBuf initialData = null;
+                    if (IoUring.isTcpFastOpenClientSideAvailable() &&
                         config().getOption(ChannelOption.TCP_FASTOPEN_CONNECT) == Boolean.TRUE) {
-                    ChannelOutboundBuffer outbound = unsafe().outboundBuffer();
-                    outbound.addFlush();
-                    Object curr;
-                    if ((curr = outbound.current()) instanceof ByteBuf) {
-                        initialData = (ByteBuf) curr;
+                        ChannelOutboundBuffer outbound = unsafe().outboundBuffer();
+                        outbound.addFlush();
+                        Object curr;
+                        if ((curr = outbound.current()) instanceof ByteBuf) {
+                            initialData = (ByteBuf) curr;
+                        }
                     }
-                }
-                if (initialData != null) {
-                    msgHdrMemoryArray = new MsgHdrMemoryArray((short) 1);
-                    MsgHdrMemory hdr = msgHdrMemoryArray.hdr(0);
-                    hdr.set(socket, inetSocketAddress, IoUring.memoryAddress(initialData),
-                            initialData.readableBytes(), (short) 0);
+                    if (initialData != null) {
+                        msgHdrMemoryArray = new MsgHdrMemoryArray((short) 1);
+                        MsgHdrMemory hdr = msgHdrMemoryArray.hdr(0);
+                        hdr.set(socket, inetSocketAddress, IoUring.memoryAddress(initialData),
+                                initialData.readableBytes(), (short) 0);
 
-                    int fd = fd().intValue();
-                    IoRegistration registration = registration();
-                    IoUringIoOps ops = IoUringIoOps.newSendmsg(fd, (byte) 0, Native.MSG_FASTOPEN,
-                            hdr.address(), hdr.idx());
-                    connectId = registration.submit(ops);
-                    if (connectId == 0) {
-                        // Directly release the memory if submitting failed.
-                        freeMsgHdrArray();
+                        int fd = fd().intValue();
+                        IoRegistration registration = registration();
+                        IoUringIoOps ops = IoUringIoOps.newSendmsg(fd, (byte) 0, Native.MSG_FASTOPEN,
+                                hdr.address(), hdr.idx());
+                        connectId = registration.submit(ops);
+                        if (connectId == 0) {
+                            // Directly release the memory if submitting failed.
+                            freeMsgHdrArray();
+                        }
+                    } else {
+                        submitConnect(inetSocketAddress);
                     }
+                } else if (remoteAddress instanceof DomainSocketAddress) {
+                    DomainSocketAddress unixDomainSocketAddress = (DomainSocketAddress) remoteAddress;
+                    submitConnect(unixDomainSocketAddress);
                 } else {
-                    submitConnect(inetSocketAddress);
+                    throw new Error("Unexpected SocketAddress implementation " + remoteAddress);
                 }
+
                 if (connectId != 0) {
                     ioState |= CONNECT_SCHEDULED;
                 }
@@ -1164,7 +1179,8 @@ abstract class AbstractIoUringChannel extends AbstractChannel implements UnixCha
     }
 
     private void submitConnect(InetSocketAddress inetSocketAddress) {
-        remoteAddressMemory = Buffer.allocateDirectWithNativeOrder(Native.SIZEOF_SOCKADDR_STORAGE);
+        cleanable = Buffer.allocateDirectBufferWithNativeOrder(Native.SIZEOF_SOCKADDR_STORAGE);
+        remoteAddressMemory = cleanable.buffer();
 
         SockaddrIn.set(socket.isIpv6(), remoteAddressMemory, inetSocketAddress);
 
@@ -1172,6 +1188,21 @@ abstract class AbstractIoUringChannel extends AbstractChannel implements UnixCha
         IoRegistration registration = registration();
         IoUringIoOps ops = IoUringIoOps.newConnect(
                 fd, (byte) 0, Buffer.memoryAddress(remoteAddressMemory), nextOpsId());
+        connectId = registration.submit(ops);
+        if (connectId == 0) {
+            // Directly release the memory if submitting failed.
+            freeRemoteAddressMemory();
+        }
+    }
+
+    private void submitConnect(DomainSocketAddress unixDomainSocketAddress) {
+        cleanable = Buffer.allocateDirectBufferWithNativeOrder(Native.SIZEOF_SOCKADDR_UN);
+        remoteAddressMemory = cleanable.buffer();
+        SockaddrIn.setUds(remoteAddressMemory, unixDomainSocketAddress);
+        int fd = fd().intValue();
+        IoRegistration registration = registration();
+        long addr = Buffer.memoryAddress(remoteAddressMemory);
+        IoUringIoOps ops = IoUringIoOps.newConnect(fd, (byte) 0, addr, Native.SIZEOF_SOCKADDR_UN, nextOpsId());
         connectId = registration.submit(ops);
         if (connectId == 0) {
             // Directly release the memory if submitting failed.

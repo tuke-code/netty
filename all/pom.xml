@@ -20,7 +20,7 @@
   <parent>
     <groupId>io.netty</groupId>
     <artifactId>netty-parent</artifactId>
-    <version>4.2.2.Final-SNAPSHOT</version>
+    <version>4.2.3.Final-SNAPSHOT</version>
   </parent>
 
   <artifactId>netty-all</artifactId>
@@ -47,20 +47,6 @@
   </dependencyManagement>
 
   <profiles>
-    <!--
-      This profile should be used during the release process together with the "native-dependencies" profile.
-      There is no need to do this by hand tho, use the ./scripts/finish_release.sh script.
-     -->
-    <profile>
-      <id>staging</id>
-      <repositories>
-        <repository>
-          <id>staged-releases</id>
-          <name>Staged Releases</name>
-          <url>https://oss.sonatype.org/service/local/repositories/${stagingRepositoryId}/content/</url>
-        </repository>
-      </repositories>
-    </profile>
     <profile>
       <id>native-dependencies</id>
       <dependencies>
@@ -216,9 +202,6 @@
       </dependencies>
     </profile>
 
-    <!-- The linux profile will only include the native jar for epoll to the all jar.
-         If you want to also include the native jar for kqueue use -Puber.
-    -->
     <profile>
       <!-- Don't active this profile based on the OS we run on so the flatten plugin will not include it -->
       <id>linux</id>
@@ -227,7 +210,6 @@
         <dependency>
           <groupId>${project.groupId}</groupId>
           <artifactId>netty-transport-native-epoll</artifactId>
-          <version>${project.version}</version>
           <classifier>${jni.classifier}</classifier>
           <scope>runtime</scope>
         </dependency>
@@ -245,9 +227,7 @@
         </dependency>
       </dependencies>
     </profile>
-    <!-- The mac, openbsd and freebsd  profile will only include the native jar for epol to the all jar.
-         If you want to also include the native jar for kqueue use -Puber.
-    -->
+
     <profile>
       <!-- Don't active this profile based on the OS we run on so the flatten plugin will not include it -->
       <id>mac</id>
@@ -256,14 +236,12 @@
         <dependency>
           <groupId>${project.groupId}</groupId>
           <artifactId>netty-transport-native-kqueue</artifactId>
-          <version>${project.version}</version>
           <classifier>${jni.classifier}</classifier>
           <scope>runtime</scope>
         </dependency>
         <dependency>
           <groupId>${project.groupId}</groupId>
           <artifactId>netty-resolver-dns-native-macos</artifactId>
-          <version>${project.version}</version>
           <classifier>${jni.classifier}</classifier>
           <scope>runtime</scope>
         </dependency>
@@ -282,7 +260,6 @@
       <plugin>
         <groupId>org.codehaus.mojo</groupId>
         <artifactId>flatten-maven-plugin</artifactId>
-        <version>1.2.2</version>
         <configuration>
           <!-- We need to also merge the dependencies defined by our profile. -->
           <embedBuildProfileDependencies>true</embedBuildProfileDependencies>
@@ -312,7 +289,6 @@
       <plugin>
         <groupId>org.basepom.maven</groupId>
         <artifactId>duplicate-finder-maven-plugin</artifactId>
-        <version>1.3.0</version>
         <executions>
           <execution>
             <id>default</id>
@@ -380,6 +356,11 @@
     <dependency>
       <groupId>${project.groupId}</groupId>
       <artifactId>netty-codec-http2</artifactId>
+      <scope>compile</scope>
+    </dependency>
+    <dependency>
+      <groupId>${project.groupId}</groupId>
+      <artifactId>netty-codec-http3</artifactId>
       <scope>compile</scope>
     </dependency>
     <dependency>
